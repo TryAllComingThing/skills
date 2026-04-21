@@ -638,226 +638,315 @@ class AutoUXAgent:
 
         return layout
 
-    async def extract_interactive_elements(self):
-        """提取所有可交互元素"""
-        interactives = []
+    async def extract_all_clickable_elements(self):
+        """提取所有可点击元素 - 不依赖关键词"""
+        all_elements = []
 
-        # 按钮和链接
-        elements = await self.page.query_selector_all("button, a, [role='button'], [role='link']")
+        # 1. 标准可交互元素
+        selectors = [
+            "button", "a", "input[type='button']", "input[type='submit']",
+            "[role='button']", "[role='link']", "[role='tab']",
+            "[onclick]", "[oncontextmenu]", "[ondblclick']",
+            "summary",  # details/summary 折叠元素
+            ".clickable", "[data-clickable='true']"
+        ]
 
-        for el in elements[:30]:  # 限制数量
+        for selector in selectors:
             try:
-                is_visible = await el.is_visible()
-                if not is_visible:
-                    continue
-
-                text = (await el.inner_text()).strip()[:50]
-                if not text:
-                    continue
-
-                # 获取元素位置
-                box = await el.bounding_box()
-
-                # 获取 href 或 action
-                href = await el.get_attribute("href")
-                action = await el.get_attribute("action")
-
-                interactives.append({
-                    "text": text,
-                    "tag": await el.evaluate("el => el.tagName"),
-                    "type": await el.get_attribute("type"),
-                    "href": href,
-                    "action": action,
-                    "position": box if box else None
-                })
+                elements = await self.page.query_selector_all(selector)
+                for el in elements:
+                    try:
+                        if not await el.is_visible():
+                            continue
+                        tag = await el.evaluate("el => el.tagName.toLowerCase()")
+                        text = (await el.inner_text()).strip()[:50]
+                        # 如果没有文本，尝试获取 aria-label 或 title
+                        if not text:
+                            text = await el.get_attribute("aria-label") or await el.get_attribute("title") or ""
+                            text = text.strip()[:50]
+                        # 跳过空白元素
+                        if not text and tag not in ["img", "svg", "icon"]:
+                            continue
+                        box = await el.bounding_box()
+                        all_elements.append({
+                            "text": text,
+                            "tag": tag,
+                            "selector": selector,
+                            "id": await el.get_attribute("id"),
+                            "class": await el.get_attribute("class"),
+                            "href": await el.get_attribute("href"),
+                            "role": await el.get_attribute("role"),
+                            "aria_label": await el.get_attribute("aria-label"),
+                            "data_action": await el.get_attribute("data-action"),
+                            "position": box if box else None
+                        })
+                    except:
+                        continue
             except:
                 continue
 
-        return interactives
+        # 2. 提取 Tab 元素（ul/li 结构）
+        try:
+            tab_lists = await self.page.query_selector_all("[role='tablist'], .nav-tabs, .tabs, .ant-tabs, .el-tabs")
+            for tab_list in tab_lists:
+                try:
+                    tabs = await tab_list.query_selector_all("[role='tab'], .nav-item, .ant-tabs-tab, .el-tabs-item")
+                    for tab in tabs:
+                        try:
+                            if not await tab.is_visible():
+                                continue
+                            text = (await tab.inner_text()).strip()[:30]
+                            if not text:
+                                continue
+                            box = await tab.bounding_box()
+                            all_elements.append({
+                                "text": f"[Tab] {text}",
+                                "tag": "tab",
+                                "selector": "[role='tab']",
+                                "id": await tab.get_attribute("id"),
+                                "role": "tab",
+                                "position": box if box else None
+                            })
+                        except:
+                            continue
+                except:
+                    continue
+        except:
+            pass
+
+        # 3. 提取下拉菜单项
+        try:
+            dropdown_items = await self.page.query_selector_all(
+                ".dropdown-item, .ant-dropdown-menu-item, .el-dropdown-menu__item, "
+                "[role='menuitem'], .menu-item, .nav-dropdown-item"
+            )
+            for item in dropdown_items[:20]:
+                try:
+                    if not await item.is_visible():
+                        continue
+                    text = (await item.inner_text()).strip()[:30]
+                    if not text:
+                        continue
+                    box = await item.bounding_box()
+                    all_elements.append({
+                        "text": f"[Menu] {text}",
+                        "tag": "menuitem",
+                        "selector": ".dropdown-item",
+                        "role": "menuitem",
+                        "position": box if box else None
+                    })
+                except:
+                    continue
+        except:
+            pass
+
+        # 4. 提取图标按钮（无文本但可点击）
+        try:
+            icon_buttons = await self.page.query_selector_all(
+                ".icon-btn, .anticon, .el-icon, [aria-label], button:empty, "
+                "button:has(img), a:has(img), [class*='icon']:not(:has-text())"
+            )
+            for btn in icon_buttons[:20]:
+                try:
+                    if not await btn.is_visible():
+                        continue
+                    aria_label = await btn.get_attribute("aria-label")
+                    title = await btn.get_attribute("title")
+                    text = aria_label or title or ""
+                    if not text:
+                        continue
+                    box = await btn.bounding_box()
+                    all_elements.append({
+                        "text": f"[Icon] {text}",
+                        "tag": await btn.evaluate("el => el.tagName.toLowerCase()"),
+                        "selector": "icon-button",
+                        "aria_label": aria_label,
+                        "title": title,
+                        "position": box if box else None
+                    })
+                except:
+                    continue
+        except:
+            pass
+
+        # 去重
+        seen = set()
+        unique_elements = []
+        for el in all_elements:
+            key = f"{el.get('text', '')}_{el.get('tag', '')}"
+            if key not in seen:
+                seen.add(key)
+                unique_elements.append(el)
+
+        return unique_elements
+
+    async def extract_interactive_elements(self):
+        """提取所有可交互元素（兼容旧接口）"""
+        return await self.extract_all_clickable_elements()
 
     async def auto_explore(self, depth=0):
-        """自动探索页面交互"""
+        """自动探索页面交互 - 不依赖关键词"""
         if depth >= self.max_depth:
             return
 
         current_url = self.page.url
-
-        # 等待页面稳定
         await asyncio.sleep(1)
 
-        # 获取可交互元素
-        interactives = await self.extract_interactive_elements()
+        # 获取所有可点击元素
+        all_elements = await self.extract_all_clickable_elements()
+        print(f"[*] 发现 {len(all_elements)} 个可点击元素")
 
-        # 业务按钮关键词
-        business_keywords = [
-            "新增", "添加", "创建", "新建", "添加",
-            "修改", "编辑", "更新", "保存",
-            "删除", "移除", "取消",
-            "授权", "权限", "分配",
-            "查询", "搜索", "查找",
-            "导入", "导出", "下载", "上传",
-            "提交", "确认", "确定",
-            "审核", "审批", "通过", "拒绝",
-            "启用", "禁用", "启用", "停用"
-        ]
+        # 跳过明显无关的元素
+        skip_patterns = ["cookie", "accept", "close", "skip", "cancel"]
 
-        # 优先处理业务按钮
-        business_elements = []
-        other_elements = []
-
-        for el_info in interactives:
+        for el_info in all_elements:
             text = el_info.get("text", "").strip()
             if not text:
                 continue
 
-            # 检查是否是业务按钮
-            is_business = any(kw in text for kw in business_keywords)
-            if is_business:
-                business_elements.append(el_info)
-            else:
-                other_elements.append(el_info)
-
-        # 先处理业务按钮
-        all_elements = business_elements + other_elements
-
-        for el_info in all_elements:
-            text = el_info.get("text", "").strip()
-            if not text or text in self.visited_elements:
-                continue
-
             # 跳过无关元素
-            skip_patterns = ["cookie", "accept", "close", "×", "skip", "取消"]
             if any(p.lower() in text.lower() for p in skip_patterns):
                 continue
 
-            # 跳过取消按钮
-            if "取消" in text:
+            # 使用元素标识作为去重键
+            element_key = f"{el_info.get('tag', '')}_{el_info.get('text', '')[:20]}"
+            if element_key in self.visited_elements:
                 continue
-
-            self.visited_elements.add(text)
+            self.visited_elements.add(element_key)
 
             try:
                 print(f"[->] 点击: {text}")
 
-                # 记录点击前状态
                 pre_url = self.page.url
                 pre_modals = await self.detect_modals_and_drawers()
 
-                # 尝试多种方式查找并点击元素
-                clicked = False
+                # 尝试点击
+                clicked = await self._smart_click(el_info)
 
-                # 方法1: 强制点击 - 使用 locator 直接点击
-                try:
-                    # 使用 locator 强制点击
-                    locator = self.page.locator(f"button:has-text('{text}'), a:has-text('{text}')")
-                    count = await locator.count()
-                    if count > 0:
-                        for i in range(count):
-                            el = locator.nth(i)
-                            try:
-                                if await el.is_visible():
-                                    await el.click()
-                                    clicked = True
-                                    print(f"[+] 点击成功: {text}")
-                                    break
-                            except:
-                                continue
-                except Exception as e1:
-                    print(f"[!] 方法1错误: {str(e1)[:30]}")
-
-                # 方法2: 通过遍历所有按钮元素匹配文本
-                if not clicked:
-                    try:
-                        all_buttons = await self.page.query_selector_all("button, a, [role='button'], input[type='button'], input[type='submit']")
-                        print(f"[*] 找到 {len(all_buttons)} 个可交互元素")
-                        for btn in all_buttons:
-                            try:
-                                btn_text = (await btn.inner_text()).strip()
-                                if text in btn_text or btn_text in text:
-                                    print(f"[*] 匹配按钮: {btn_text}")
-                                    if await btn.is_visible():
-                                        await btn.click()
-                                        clicked = True
-                                        print(f"[+] 点击成功(btn): {text}")
-                                        break
-                            except Exception as e2:
-                                print(f"[!] 点击错误: {str(e2)[:30]}")
-                                continue
-                    except Exception as e3:
-                        print(f"[!] 方法2错误: {str(e3)[:30]}")
-
-                if not clicked:
-                    print(f"[!] 无法点击: {text}")
-                    continue
-
-                # 等待变化
                 await asyncio.sleep(1.5)
 
-                # 检测变化
                 post_url = self.page.url
                 post_modals = await self.detect_modals_and_drawers()
 
                 # 记录交互
                 interaction = {
                     "from": text,
+                    "tag": el_info.get("tag", ""),
                     "action": "click",
                     "pre_url": pre_url,
                     "post_url": post_url,
                     "result": "",
-                    "business_type": self._classify_business_action(text)
+                    "clicked": clicked
                 }
 
-                # 判断结果
                 if pre_url != post_url:
-                    interaction["result"] = f"页面跳转: {post_url}"
-                    print(f"[+] 页面跳转: {post_url}")
+                    interaction["result"] = f"跳转: {post_url}"
+                    print(f"[+] 页面跳转")
                     if post_url not in self.visited_urls:
                         self.visited_urls.add(post_url)
                         self.results["interactions"].append(interaction)
-
-                        # 递归探索新页面
                         await self.capture_current_state(f"page_{len(self.visited_urls)}")
                         await self.auto_explore(depth + 1)
-
-                        # 返回
                         await self.page.go_back()
                         await asyncio.sleep(1)
                 elif post_modals:
-                    interaction["result"] = f"触发弹窗/抽屉: {len(post_modals)} 个"
-                    print(f"[+] 触发弹窗: {len(post_modals)} 个")
+                    interaction["result"] = f"弹窗: {len(post_modals)} 个"
+                    print(f"[+] 触发弹窗")
                     self.results["interactions"].append(interaction)
-
-                    # 分析弹窗内容
                     await self.capture_current_state(f"modal_{text[:10]}")
-
-                    # 关闭弹窗 - 尝试按 ESC 或点击遮罩
-                    try:
-                        await self.page.keyboard.press("Escape")
-                        await asyncio.sleep(0.5)
-                    except:
-                        pass
-
-                    close_buttons = await self.page.query_selector_all(
-                        "[class*='close'], [class*='modal'] button, [aria-label*='close'], .×, button:has-text('×')"
-                    )
-                    for btn in close_buttons[:2]:
-                        try:
-                            await btn.click()
-                            break
-                        except:
-                            pass
-                else:
-                    # 检查是否有 DOM 变化
-                    interaction["result"] = "DOM 变化"
-                    print(f"[+] DOM 变化")
+                    await self.page.keyboard.press("Escape")
+                    await asyncio.sleep(0.5)
+                elif clicked:
+                    interaction["result"] = "DOM变化"
+                    print(f"[+] DOM变化")
                     self.results["interactions"].append(interaction)
-
-                    # 抓取变化后的状态
-                    await self.capture_current_state(f"after_click_{text[:10]}")
 
             except Exception as e:
-                print(f"[!] 点击出错: {text} - {str(e)[:50]}")
+                print(f"[!] 点击出错: {text} - {str(e)[:40]}")
                 continue
+
+    async def _smart_click(self, el_info):
+        """智能点击 - 多种策略尝试点击元素"""
+        text = el_info.get("text", "")
+        tag = el_info.get("tag", "")
+        element_id = el_info.get("id")
+        role = el_info.get("role")
+        aria_label = el_info.get("aria_label")
+
+        # 策略1: 如果有 id，使用 id 选择
+        if element_id:
+            try:
+                el = await self.page.query_selector(f"#{element_id}")
+                if el and await el.is_visible():
+                    await el.click()
+                    return True
+            except:
+                pass
+
+        # 策略2: 使用 role 属性
+        if role:
+            try:
+                locator = self.page.locator(f"[role='{role}']")
+                count = await locator.count()
+                for i in range(min(count, 3)):
+                    el = locator.nth(i)
+                    if await el.is_visible():
+                        await el.click()
+                        return True
+            except:
+                pass
+
+        # 策略3: 使用 aria-label
+        if aria_label:
+            try:
+                el = await self.page.query_selector(f"[aria-label='{aria_label}']")
+                if el and await el.is_visible():
+                    await el.click()
+                    return True
+            except:
+                pass
+
+        # 策略4: 使用文本匹配 (处理 [Tab], [Menu], [Icon] 前缀)
+        clean_text = text.replace("[Tab]", "").replace("[Menu]", "").replace("[Icon]", "").strip()
+        if clean_text:
+            try:
+                # 尝试多种选择器
+                for selector in [
+                    f"button:has-text('{clean_text}')",
+                    f"a:has-text('{clean_text}')",
+                    f"[role='button']:has-text('{clean_text}')",
+                    f"[role='tab']:has-text('{clean_text}')"
+                ]:
+                    try:
+                        locator = self.page.locator(selector)
+                        count = await locator.count()
+                        if count > 0:
+                            for i in range(count):
+                                el = locator.nth(i)
+                                if await el.is_visible():
+                                    await el.click()
+                                    return True
+                    except:
+                        continue
+            except:
+                pass
+
+        # 策略5: 使用 XPath 文本匹配
+        if clean_text:
+            try:
+                xpath = f"//*[contains(text(), '{clean_text}')]"
+                elements = await self.page.query_selector_all(f"xpath={xpath}")
+                for el in elements[:3]:
+                    try:
+                        if await el.is_visible():
+                            await el.click()
+                            return True
+                    except:
+                        continue
+            except:
+                pass
+
+        return False
 
     def _classify_business_action(self, text):
         """分类业务动作"""
@@ -983,20 +1072,7 @@ class AutoUXAgent:
 
         # 六、页面还原备注
         md.append("\n## 六、页面还原备注\n")
-        md.append("### Design Tokens\n")
-        md.append("**颜色**:\n")
-        for c in colors[:10]:
-            md.append(f"- {c}\n")
-
-        md.append("\n**字体大小**:\n")
-        for fs in font_sizes:
-            md.append(f"- {fs}\n")
-
-        md.append("\n**圆角**:\n")
-        for br in border_radius:
-            md.append(f"- {br}\n")
-
-        md.append("\n### 布局特点\n")
+        md.append("### 布局特点\n")
         if layout:
             if layout.get("header"):
                 md.append("- 顶部 Header 固定高度\n")
@@ -1170,20 +1246,33 @@ HTML代码片段（前5000字符）:
 
     async def run_llm_analysis(self):
         """完整的 LLM 分析流程"""
-        # 1. 多方向滚动探索页面
-        print("\n=== Phase 1: 页面探索 ===")
-        await self.scroll_explore_all_directions()
+        async with async_playwright() as p:
+            await self.setup(p)
 
-        # 2. 捕获页面信息
-        page_data = await self.capture_page_for_llm()
+            # 访问首页
+            await self.page.goto(self.start_url)
+            await self.page.wait_for_load_state("networkidle")
 
-        # 3. LLM 分析
-        print("\n=== Phase 2: LLM 智能分析 ===")
-        llm_result = await self.analyze_with_llm(page_data)
+            # 处理登录
+            if await self.is_login_required():
+                await self.wait_for_user_login()
+                await self.page.goto(self.start_url)
+                await self.page.wait_for_load_state("networkidle")
 
-        if llm_result:
-            # 保存分析结果
-            self.results["llm_analysis"] = llm_result
+            # 1. 多方向滚动探索页面
+            print("\n=== Phase 1: 页面探索 ===")
+            await self.scroll_explore_all_directions()
+
+            # 2. 捕获页面信息
+            page_data = await self.capture_page_for_llm()
+
+            # 3. LLM 分析
+            print("\n=== Phase 2: LLM 智能分析 ===")
+            llm_result = await self.analyze_with_llm(page_data)
+
+            if llm_result:
+                # 保存分析结果
+                self.results["llm_analysis"] = llm_result
 
             # 4. 根据 LLM 结果生成操作序列
             print("\n=== Phase 3: 生成操作序列 ===")
@@ -1287,16 +1376,10 @@ HTML代码片段（前5000字符）:
             # 生成 Markdown
             markdown = self.generate_markdown()
 
-            # 保存结果 - 转换 set 为 list 以便 JSON 序列化
+            # 保存结果
             results_copy = {
                 "pages": self.results["pages"],
-                "interactions": self.results["interactions"],
-                "design_tokens": {
-                    "colors": list(self.results["design_tokens"]["colors"]),
-                    "font_sizes": list(self.results["design_tokens"]["font_sizes"]),
-                    "border_radius": list(self.results["design_tokens"]["border_radius"]),
-                    "spacing": list(self.results["design_tokens"]["spacing"])
-                }
+                "interactions": self.results["interactions"]
             }
 
             # 添加导航和表单分析结果
@@ -1342,9 +1425,9 @@ if __name__ == "__main__":
         print("\n*** 使用 LLM 辅助分析模式 ***\n")
         # 检查 API Key
         import os
-        if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("CLAUDE_API_KEY"):
-            print("[!] 请设置 ANTHROPIC_API_KEY 环境变量")
-            print("[!] 示例: set ANTHROPIC_API_KEY=sk-...")
+        if not os.environ.get("DASHSCOPE_API_KEY"):
+            print("[!] 请设置 DASHSCOPE_API_KEY 环境变量")
+            print("[!] 示例: set DASHSCOPE_API_KEY=sk-...")
             sys.exit(1)
 
         agent = AutoUXAgent(url, max_depth=depth)
@@ -1353,13 +1436,7 @@ if __name__ == "__main__":
         # 保存结果
         results_copy = {
             "pages": agent.results["pages"],
-            "interactions": agent.results["interactions"],
-            "design_tokens": {
-                "colors": list(agent.results["design_tokens"]["colors"]),
-                "font_sizes": list(agent.results["design_tokens"]["font_sizes"]),
-                "border_radius": list(agent.results["design_tokens"]["border_radius"]),
-                "spacing": list(agent.results["design_tokens"]["spacing"])
-            }
+            "interactions": agent.results["interactions"]
         }
         if "llm_analysis" in agent.results:
             results_copy["llm_analysis"] = agent.results["llm_analysis"]
